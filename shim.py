@@ -25,7 +25,7 @@ from typing import AsyncIterator
 import httpx
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import Response, StreamingResponse
+from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 
@@ -58,7 +58,8 @@ def _merge_thinking(body: bytes, path_suffix: str) -> bytes:
         except (json.JSONDecodeError, UnicodeDecodeError):
             return body
         if isinstance(data, dict) and THINKING in ("disabled", "enabled"):
-            data.setdefault("thinking", {"type": THINKING})
+            # Cursor may send thinking:enabled in body; if env forces disabled, override it.
+            data["thinking"] = {"type": THINKING}
             return json.dumps(data, ensure_ascii=False).encode("utf-8")
     return body
 
@@ -118,7 +119,11 @@ async def proxy_request(request: Request) -> Response:
         "transfer-encoding",
         "upgrade",
     }
-    out_headers = [(k, v) for k, v in upstream.headers.items() if k.lower() not in hop_skip]
+    # Starlette 1.x StreamingResponse expects Mapping[str, str] (items()), not list[tuple].
+    hdr_out: dict[str, str] = {}
+    for k, v in upstream.headers.items():
+        if k.lower() not in hop_skip:
+            hdr_out[k] = v
 
     async def stream_body() -> AsyncIterator[bytes]:
         try:
@@ -130,7 +135,19 @@ async def proxy_request(request: Request) -> Response:
     return StreamingResponse(
         stream_body(),
         status_code=upstream.status_code,
-        headers=out_headers,
+        headers=hdr_out,
+    )
+
+
+async def root(_: Request) -> Response:
+    """Browser / curl / without path — avoid 500 on GET /."""
+    return JSONResponse(
+        {
+            "service": "moonshot_cursor_shim",
+            "health": "/health",
+            "cursor_openai_base": f"http://{BIND}/v1",
+            "hint": "Use Base URL http://127.0.0.1:8765/v1 in Cursor (see README).",
+        }
     )
 
 
@@ -160,6 +177,7 @@ async def lifespan(app: Starlette):
 def build_app() -> Starlette:
     return Starlette(
         routes=[
+            Route("/", root, methods=["GET"]),
             Route("/health", health, methods=["GET"]),
             Route("/{path:path}", proxy_request, methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]),
         ],
